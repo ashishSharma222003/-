@@ -10,6 +10,7 @@ from llama_index.core.workflow import (
 )
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.bridge.pydantic import BaseModel, Field
+from typing import Dict, List, Optional
 from llm_imp import llm
 from prompt import *
 class Observation(BaseModel):
@@ -25,15 +26,31 @@ class UserGoalsFeedback(BaseModel):
 
 class StackInfo(BaseModel):
     structure: str = Field(
-        description="The folder structure or file organization for saving project files."
+        description=(
+            "The folder structure or file organization for saving project files.\n"
+            "Example:\n"
+            "project-name/\n"
+            "│\n"
+            "├── src/                # Source code\n"
+            "│   └── main.py         # Main application/script\n"
+            "│\n"
+            "├── tests/              # Test files\n"
+            "│   └── test_main.py    # Unit tests\n"
+            "│\n"
+            "├── README.md           # Project overview\n"
+            "├── requirements.txt    # Dependencies\n"
+            "└── .gitignore          # Files to ignore in Git"
+        )
     )
     requirements: str = Field(
-        description="List of requirements needed to develop the project based on the given idea."
+        description="A list of requirements or dependencies needed to develop the project based on the given idea."
     )
     tech_stack: str = Field(
-        description="Recommended technologies, frameworks, or tools to be used in the project."
+        description="Recommended technologies, frameworks, libraries, or tools to be used in the project."
     )
-
+class CodeFile(BaseModel):
+    relative_file_name:str=Field(description="The relative file path like this - `<project-name>/<folder>/file_name`")
+    code:str=Field(description="Code for the respective file")
 class ProgressEvent(Event):
     msg: str
 class StackProgress(Event):
@@ -50,6 +67,18 @@ class Questionare(Event):
     structure:str
     requirements:str
     tech_stack:str
+class RetryCode:
+    changes:str
+
+class FileQuery(BaseModel):
+    file_names: list = Field(
+        default_factory=list,
+        description="contains the relative name/path of the files"
+    )
+    queries: list = Field(
+        default_factory=list,
+        description="contains the question to respective index file name"
+    )
 
 class CodeMate(Workflow):
     def __init__(self,max_steps:int=3, **kwargs):
@@ -198,7 +227,155 @@ class CodeMate(Workflow):
                 return Questionare(requirements=stackinfo.requirements,structure=stackinfo.structure,tech_stack=stackinfo.tech_stack)
             else:
                 return RetryStack(re_request=human_feedback)
-        
+            
+
+    @step
+    async def coding(
+        self,ctx:Context,ev:Questionare|RetryCode
+    )->StopEvent:
+        generated_objective=await ctx.get("objectives")
+        structure=await ctx.get("file_structure")
+        requirements=await ctx.get("requirements")
+        tech_stack=await ctx.get("tech_stack")
+        if isinstance(ev,Questionare):
+            prompt=(
+                        f"This the file we are talking about - {file_path}\n"
+                        f"This is the file structure - {structure}\n"
+                        f"This is the list of requriements - {requirements}\n"
+                        f"Tech stack is this - {tech_stack}\n"
+                        f"This is the objective of the code - {generated_objective}\n"
+                        f"Write me this file code -{file_path}"
+                        "The structure of your output should be like this - \n"
+                        "<file path>\n"
+                        "<code in the respective file>"
+                        "<any other info>"
+                    )
+            lines = structure.strip().split("\n")
+            # Track the current directory level
+            current_path = "."
+            for line in lines:
+                # Remove leading/trailing whitespace and split into parts
+                line = line.strip()
+                if not line:
+                    continue  # Skip empty lines
+                
+                # Check if it's a directory or file
+                if line.endswith("/"):
+                    # It's a directory
+                    dir_name = line.strip().rstrip("/")
+                    dir_path = current_path / dir_name
+                    print(f"Directory: {dir_path}")
+                    current_path = dir_path  # Move into the directory
+                elif "└──" in line or "├──" in line:
+                    # It's a file (indicated by └── or ├──)
+                    file_name = line.split("── ")[-1].strip()
+                    file_path = current_path / file_name
+                    print(f"File: {file_path}")
+                    
+                    generator = await self.llm.astream_complete(prompt)
+                    async for response in generator:
+                    # Allow the workflow to stream this piece of response
+                        ctx.write_event_to_stream(ProgressEvent(msg=response.delta))
+                    code_description=(
+                        "This is the file structure -\n\n{file_structure}\n\n"
+                        "This is the code for the given relative file path -{file_path} and file name -{file_name}\n"
+                        "This is the code generated by the system for the given file-\n\n{code}"
+                    )
+                    files=self.llm.structured_predict(
+                        CodeFile,
+                        PromptTemplate(code_description),
+                        file_structure=structure,
+                        file_path=file_path,
+                        file_name=file_name,
+                        code=str(response)
+                    )
+                    await ctx.set(files.relative_file_name,files.code)
+                elif "│" in line:
+                    # It's a continuation of the structure (indentation)
+                    continue
+                else:
+                    # It's a root-level file or directory
+                    if line.endswith("/"):
+                        dir_name = line.strip().rstrip("/")
+                        dir_path = current_path / dir_name
+                        print(f"Directory: {dir_path}")
+                        current_path = dir_path
+                    else:
+                        file_path = current_path / line.strip()
+                        print(f"File: {file_path}")
+                        code_description=(
+                            "This is the file structure -\n\n{file_structure}\n\n"
+                            "This is the code for the given relative file path -{file_path} and file name -{file_name}\n"
+                            "This is the code generated by the system for the given file-\n\n{code}"
+                        )
+                        generator = await self.llm.astream_complete(prompt)
+                        async for response in generator:
+                        # Allow the workflow to stream this piece of response
+                            ctx.write_event_to_stream(ProgressEvent(msg=response.delta))
+                        files=self.llm.structured_predict(
+                            CodeFile,
+                            PromptTemplate(code_description),
+                            file_structure=structure,
+                            file_path=file_path,
+                            file_name=file_name,
+                            code=str(response)
+                        )
+                        await ctx.set(files.relative_file_name,files.code)
+            human_input=input("if you want to do some changes in any of the file, mention those file name and their changes if you don't want just write `no`")
+            if "no" in human_input.lower():
+                return StopEvent(result="Hurray Project is completed!!!")
+            else:
+                return RetryCode(changes=human_input)
+        elif isinstance(ev,RetryCode):
+            changes=ev.changes
+            prompt=(
+                "This is the structure of files in this project- \n\n{structure}\n\n"
+                "this is the queries user have - \n\n{changes}"
+            )
+            file_query=self.llm.structured_predict(
+                FileQuery,
+                PromptTemplate(prompt),
+                structure=structure,
+                changes=changes
+            )
+            for name_files, query_files in zip(file_query.file_names, file_query.queries):
+                prev_code=await ctx.get(name_files,"")
+                change=(
+                    f"Objective of the project -\n{generated_objective}\n"
+                    f"file structure of the given project - \n{structure}\n"
+                    f"previous code - \n{prev_code}\n"
+                    f"changes suggested by the given user for the given file name-{name_files} and the suggestions is -\n{query_files}\n"
+                    "The structure of your output should be like this - \n"
+                    "<file path>\n"
+                    "<code in the respective file>"
+                    "<any other info>"
+                )
+                generator = await self.llm.astream_complete(change)
+                async for response in generator:
+                    # Allow the workflow to stream this piece of response
+                    ctx.write_event_to_stream(ProgressEvent(msg=response.delta))
+                code_description=(
+                            "This is the file structure -\n\n{file_structure}\n\n"
+                            "This is the code for the given relative file path -{file_path} \n"
+                            "This is the code generated by the system for the given file-\n\n{code}"
+                        )
+                files=self.llm.structured_predict(
+                            CodeFile,
+                            PromptTemplate(code_description),
+                            file_structure=structure,
+                            file_path=file_path,
+                            code=str(response)
+                        )
+                await ctx.set(files.relative_file_name,files.code)
+            human_input=input("if you want to do some changes in any of the file, mention those file name and their changes if you don't want just `no`")
+            if "no" in human_input.lower():
+                return StopEvent(result="Hurray Project is completed!!!")
+            else:
+                return RetryCode(changes=human_input)
+
+
+
+
     
 
 
