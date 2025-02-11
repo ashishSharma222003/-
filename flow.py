@@ -383,9 +383,15 @@ class CodeMate(Workflow):
 
 
 
-async def main():
+async def main(query:str):
+    w=CodeMate(timeout=None)
+    result=w.run(input=str)
 
-           
+if __name__=="__main__":
+    import asyncio
+    query=""
+    asyncio.run(main(query))
+    
 
 
         
